@@ -15,9 +15,10 @@ export function exportRoutes(app, db, storage, cfg) {
   app.get(`${p}/exports`, async (req, res) => { requireRole(req.dashboard, 'superadmin', 'admin', 'bank'); const application = await scoped(req.dashboard, req.query.application_id); res.json({ success: true, data: await db('dashboard_exports').select('id', 'state', 'request', 'sha256', 'error', 'created_at', 'updated_at').where({ application_id: application.id }).orderBy('created_at', 'desc').limit(50) }); });
   app.post(`${p}/exports`, async (req, res) => {
     requireRole(req.dashboard, 'superadmin', 'admin', 'bank'); const application = await scoped(req.dashboard, req.body?.application_id);
-    const { from, to, format = 'xlsx', entities = ['users', 'call_history'] } = req.body;
+    const { from, to, format = 'xlsx', entities = ['users', 'call_history'], title = '' } = req.body;
+    if (typeof title !== 'string' || title.length > 200) throw fail(422, 'INVALID_EXPORT_TITLE');
     if (!isoDay(from) || !isoDay(to) || from > to || !['xlsx', 'csv'].includes(format) || !Array.isArray(entities) || !entities.length || !entities.every(x => allowed.includes(x))) throw fail(422, 'INVALID_EXPORT_REQUEST');
-    const [row] = await db('dashboard_exports').insert({ id: randomUUID(), application_id: application.id, requested_by: req.dashboard.role === 'officer' ? null : req.dashboard.id, request: { from, to, format, entities } }).returning('id', 'state', 'request', 'created_at');
+    const [row] = await db('dashboard_exports').insert({ id: randomUUID(), application_id: application.id, requested_by: req.dashboard.role === 'officer' ? null : req.dashboard.id, request: { title: title.trim(), from, to, format, entities } }).returning('id', 'state', 'request', 'created_at');
     await audit(db, req.dashboard, 'export.requested', { id: row.id }, application.bank_id); res.status(202).json({ success: true, data: row });
   });
   app.get(`${p}/exports/:id/download`, async (req, res) => {
@@ -40,8 +41,26 @@ export async function processOneExport(db, storage, cfg) {
     const start = new Date(`${job.request.from}T00:00:00+07:00`); const end = new Date(Date.parse(`${job.request.to}T00:00:00+07:00`) + 86_400_000);
     const sheets = [];
     if (job.request.entities.includes('users')) {
-      const rows = await db('platform_customers as c').join('dashboard_customer_applications as m', 'c.id', 'm.customer_id').where({ 'm.application_id': application.id, 'c.tenant_id': bank.tenant_id }).where('c.created_at', '>=', start).where('c.created_at', '<', end).select('c.id', 'c.verification_status', 'c.created_at').limit(50_001);
-      sheets.push(['users', ['id', 'verification_status', 'created_at'], rows.map(row => [row.id, row.verification_status, row.created_at?.toISOString()])]);
+      const rows = await db('platform_customers as c').join('dashboard_customer_applications as m', 'c.id', 'm.customer_id').where({ 'm.application_id': application.id, 'c.tenant_id': bank.tenant_id }).whereNull('c.deleted_at').where('c.created_at', '>=', start).where('c.created_at', '<', end).select('c.id', 'c.verification_status', 'c.created_at').limit(50_001);
+      if (rows.length > 50000) throw fail(422, 'EXPORT_ROW_LIMIT');
+      if (!cfg.masterUrl || !cfg.gatewaySecret) throw fail(503, 'MASTER_NOT_CONFIGURED');
+      const profiles = [];
+      // Use the owning master API to preserve the external encryption contract.
+      // Bound concurrency and renew the lease while producing a large report.
+      for (let index = 0; index < rows.length; index += 10) {
+        const batch = await Promise.all(rows.slice(index, index + 10).map(async row => {
+          let response;
+          try { response = await fetch(`${cfg.masterUrl}/api/v1/users/${row.id}`, { headers: { 'x-gateway-secret': cfg.gatewaySecret, 'x-application-id': bank.tenant_id }, signal: AbortSignal.timeout(10000), redirect: 'error' }); }
+          catch { throw fail(503, 'MASTER_UNAVAILABLE'); }
+          const result = await response.json().catch(() => null);
+          if (!response.ok || !result?.data) throw fail(503, 'CUSTOMER_EXPORT_UNAVAILABLE');
+          return result.data;
+        }));
+        profiles.push(...batch);
+        await db('dashboard_exports').where({ id: job.id, state: 'running' }).update({ lease_until: new Date(Date.now() + 300000) });
+      }
+      const columns = ['id', 'name', 'id_number', 'phone_number', 'email', 'birth_place', 'birth_date', 'sex', 'religion', 'marital_status', 'verification_status', 'occupation', 'occupation_detail', 'addresses', 'fund', 'bank_account', 'created_at'];
+      sheets.push(['users', columns, profiles.map(profile => columns.map(key => typeof profile[key] === 'object' && profile[key] !== null ? JSON.stringify(profile[key]) : profile[key] ?? ''))]);
     }
     if (job.request.entities.includes('call_history')) {
       const rows = await db('platform_calls as c').join('dashboard_customer_applications as m', 'c.user_id', 'm.customer_id').where({ 'm.application_id': application.id, 'c.tenant_id': bank.tenant_id }).where('c.created_at', '>=', start).where('c.created_at', '<', end).select('c.id', 'c.user_id', 'c.state', 'c.outcome', 'c.reason', 'c.started_at', 'c.ended_at').limit(50_001);

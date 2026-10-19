@@ -13,7 +13,10 @@ export class Storage {
   async head(Bucket, Key) { return this.client.send(new HeadObjectCommand({ Bucket, Key })); }
   async delete(Bucket, Key) { return this.client.send(new DeleteObjectCommand({ Bucket, Key })); }
   async copy(Bucket, SourceKey, Key) {
-    const source = await this.get(Bucket, SourceKey);
+    return this.copyBetween(Bucket, SourceKey, Bucket, Key);
+  }
+  async copyBetween(SourceBucket, SourceKey, Bucket, Key) {
+    const source = await this.get(SourceBucket, SourceKey);
     const upload = new Upload({ client: this.client, params: { Bucket, Key, Body: source.Body, ContentType: source.ContentType, Metadata: source.Metadata } });
     await upload.done();
   }

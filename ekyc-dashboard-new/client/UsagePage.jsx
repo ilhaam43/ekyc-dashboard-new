@@ -1,0 +1,11 @@
+import { useEffect, useState } from 'react';
+
+const wibToday = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+export default function UsagePage({ applicationId, api, refreshKey }) {
+  const [from, setFrom] = useState(wibToday), [to, setTo] = useState(wibToday), [data, setData] = useState(null), [error, setError] = useState('');
+  const query = new URLSearchParams({ application_id: applicationId, from, to }).toString();
+  useEffect(() => { let current = true; setError(''); api(`/usage?${query}`).then(result => { if (current) setData(result); }).catch(err => { if (current) { setData(null); setError(err.message); } }); return () => { current = false; }; }, [api, query, refreshKey]);
+  const total = data?.totals?.reduce((sum, row) => sum + Number(row.doc_count), 0) || 0;
+  const maximum = Math.max(1, ...(data?.timeline || []).map(row => Number(row.doc_count)));
+  return <section><div className="page-heading"><div><p className="eyebrow">APPLICATION USAGE</p><h1>API Usage</h1><p>Pemakaian layanan dan tren harian berdasarkan waktu WIB.</p></div><a className="primary" href={`/dashboard/api/v1/usage/export?${query}`}>Export Excel</a></div>{error && <div role="alert" className="notice">{error}</div>}<div className="history-filters"><label>Dari (WIB)<input type="date" value={from} onChange={e => setFrom(e.target.value)}/></label><label>Sampai (WIB)<input type="date" value={to} onChange={e => setTo(e.target.value)}/></label></div>{data?.source === 'synthetic' && <p className="info-panel">Data simulasi lokal — bukan tagihan/pemakaian nasabah nyata.</p>}<div className="history-stats"><div><span>Total requests</span><strong>{total}</strong></div>{data?.totals.map(row => <div key={row.key}><span>{row.key}</span><strong>{row.doc_count}</strong></div>)}</div><div className="detail-panel"><h2>Daily usage</h2>{data?.timeline.length ? <div className="usage-chart">{data.timeline.map((row, index) => <div key={`${row.key || row.key_as_string}-${index}`}><span>{row.key_as_string?.slice(0, 10) || row.key}</span><meter min="0" max={maximum} value={Number(row.doc_count)}/><strong>{row.doc_count}</strong></div>)}</div> : <p>Belum ada pemakaian pada rentang tanggal ini.</p>}</div></section>;
+}

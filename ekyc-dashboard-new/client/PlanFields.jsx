@@ -1,0 +1,20 @@
+import { useEffect, useState } from 'react';
+
+const features = ['user', 'agent', 'liveness', 'api-usage'];
+const periods = ['second', 'minute', 'hour', 'day', 'month', 'year'];
+const featureLabels = { user: 'User', agent: 'Video Call', liveness: 'Liveness', 'api-usage': 'API Usage' };
+export default function PlanFields({ values, setValues, api }) {
+  const [routes, setRoutes] = useState([]), [error, setError] = useState(''), [source, setSource] = useState('');
+  useEffect(() => { let current = true; api('/plan-routes').then(data => { if (current) { setRoutes(data.rows); setSource(data.source); } }).catch(err => { if (current) setError(err.message); }); return () => { current = false; }; }, [api]);
+  const limits = values.limits || {}, selected = limits.routes || [];
+  const update = patch => setValues(previous => ({ ...previous, limits: { ...previous.limits, ...patch } }));
+  const toggle = (route, enabled) => update({ routes: enabled ? [...selected, { id: route.id, limit: 60, period: 'minute' }] : selected.filter(row => row.id !== route.id) });
+  const selectedFeatures = Array.isArray(values.features) ? values.features : [];
+  return <>
+    <fieldset className="plan-features"><legend>Dashboard features</legend>{[...new Set([...features, ...selectedFeatures])].map(feature => <label key={feature}><input type="checkbox" checked={selectedFeatures.includes(feature)} onChange={event => setValues(previous => ({ ...previous, features: event.target.checked ? [...selectedFeatures, feature] : selectedFeatures.filter(value => value !== feature) }))}/>{featureLabels[feature] || feature}</label>)}</fieldset>
+    <label>ACL group<input value={limits.acl_group || ''} placeholder="Default: plan-shortname" onChange={e => update({ acl_group: e.target.value || undefined })}/></label>
+    <label>Rate limit type<select value={limits.type || 'global'} onChange={e => update({ type: e.target.value })}><option value="none">No Rate Limiting</option><option value="global">Global per application</option><option value="routes">Per API route</option></select></label>
+    {(limits.type || 'global') === 'global' && <><label>Request limit<input type="number" min="1" max="1000000" required value={limits.limit ?? limits.requests_per_minute ?? 60} onChange={e => update({ limit: Number(e.target.value), requests_per_minute: undefined })}/></label><label>Period<select value={limits.period || 'minute'} onChange={e => update({ period: e.target.value })}>{periods.map(period => <option key={period}>{period}</option>)}</select></label></>}
+    <fieldset className="plan-routes"><legend>Services</legend><p>Empty selection uses the configured default API route. Public routes cannot be assigned.</p>{source === 'synthetic' && <p>Local simulation routes.</p>}{error && <p role="alert">{error}</p>}{routes.map(route => { const chosen = selected.find(row => row.id === route.id); return <div key={route.id} className="plan-route"><label><input aria-label={route.name} type="checkbox" checked={!!chosen} onChange={e => toggle(route, e.target.checked)}/><span>{route.name}<small className="field-help">{route.methods?.join(', ') || 'ALL'} {route.paths?.join(', ') || ''}</small></span></label>{chosen && limits.type === 'routes' && <><label>Requests<input type="number" min="1" max="1000000" required value={chosen.limit} onChange={e => update({ routes: selected.map(row => row.id === route.id ? { ...row, limit: Number(e.target.value) } : row) })}/></label><label>Period<select value={chosen.period} onChange={e => update({ routes: selected.map(row => row.id === route.id ? { ...row, period: e.target.value } : row) })}>{periods.map(period => <option key={period}>{period}</option>)}</select></label></>}</div>; })}</fieldset>
+  </>;
+}

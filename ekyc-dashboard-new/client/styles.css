@@ -10,6 +10,8 @@
   --border: #dfe7f0;
 }
 
+/* Match the operational dashboard: navy header, light navigation, sectioned forms. */
+
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; }
 body { margin: 0; min-width: 320px; }
@@ -238,3 +240,24 @@ tbody tr:hover { background: #fbfdff; }
   .auth-page { grid-template-rows: 150px 1fr; }
   .auth-card { width: calc(100% - 30px); padding: 28px 24px; }
 }
+.history-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 16px; margin: 20px 0; }
+.history-filters label, .history-pagination label { display: grid; gap: 7px; color: #58677b; font-size: 13px; }
+.history-stats { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; }
+.history-stats > div { background: white; border: 1px solid #e0e6ef; padding: 16px 20px; min-width: 125px; border-radius: 8px; }
+.history-stats span { display: block; font-size: 12px; color: #69768a; text-transform: capitalize; }
+.history-stats strong { display: block; font-size: 23px; margin-top: 6px; color: #233c60; }
+.history-pagination { display: flex; justify-content: flex-end; align-items: center; flex-wrap: wrap; gap: 16px; margin-top: 18px; }
+.plan-features, .plan-routes { grid-column: 1 / -1; border: 1px solid #dde4ed; border-radius: 8px; padding: 16px; min-width: 0; }
+.plan-features label, .plan-route > label:first-child { display: flex; align-items: center; gap: 9px; margin: 8px 0; }
+.plan-features input, .plan-route input[type=checkbox] { width: 18px; min-height: 18px; }
+.plan-route { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid #edf0f5; padding: 12px 0; }
+.plan-route > label:first-child { flex: 1; min-width: 180px; }
+.plan-route input[type=number] { width: 100px; }
+.plan-routes p { font-size: 13px; color: #68788b; }
+
+.usage-chart > div { display: grid; grid-template-columns: 110px 1fr 65px; align-items: center; gap: 16px; margin: 18px 0; }
+.usage-chart meter { width: 100%; height: 24px; }
+
+.customer-section { border-top: 1px solid #e6ebf2; margin-top: 18px; padding-top: 16px; }
+.customer-documents { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+.customer-documents img { width: 100%; max-height: 240px; object-fit: contain; }

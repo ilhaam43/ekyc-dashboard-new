@@ -2,6 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
 import bcrypt from 'bcryptjs';
 import { fail, requireRole, audit } from './auth.js';
+import { reportQuery } from './reports.js';
+import { makeXlsx } from './xlsx.js';
 
 const json = (res, data) => res.json({ success: true, data });
 const limit = req => Math.min(100, Math.max(1, Number(req.query.limit) || 25));
@@ -18,6 +20,30 @@ export function platformRoutes(app, db, cfg, storage, adapters, management) {
     const bank = await management.bank(application.bank_id);
     return { application, bank };
   }
+  app.use(p, async (req, _res, next) => {
+    try {
+      const kind = req.path.split('/')[1];
+      if (kind === 'customers' && req.path.split('/')[2] && req.path.split('/')[2] !== 'report') {
+        const legacyId = decodeURIComponent(req.path.split('/')[2]);
+        if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(legacyId)) {
+          const mapped = await db('dashboard_id_map').whereIn('entity', ['user', 'customer']).where({ legacy_id: legacyId }).first();
+          if (!mapped) throw fail(404, 'CUSTOMER_NOT_FOUND');
+          req.url = req.url.replace(/^\/customers\/[^/?]+/, `/customers/${mapped.platform_id}`);
+        }
+      }
+      const feature = { agents: 'agent', calls: 'agent', customers: 'user', documents: 'user', usage: 'api-usage' }[kind];
+      const applicationId = req.query.application_id || req.body?.application_id;
+      if (!feature || !applicationId) return next();
+      const { application } = await context(applicationId, req.dashboard);
+      const plan = await db('dashboard_plans').where({ id: application.plan_id }).first();
+      if (!plan?.features?.includes(feature)) throw fail(403, 'FEATURE_NOT_IN_PLAN');
+      // Stored history remains accessible for suspended subscriptions. New
+      // agents/customer mutations still require an approved active application.
+      if (!['GET', 'HEAD'].includes(req.method) && application.status !== 'confirmed') throw fail(403, 'APPLICATION_NOT_ACTIVE');
+      if (kind === 'calls' || kind === 'usage') requireRole(req.dashboard, 'superadmin', 'bank');
+      next();
+    } catch (error) { next(error); }
+  });
   async function master(tenantId, path, { method = 'GET', body } = {}) {
     let response;
     try { response = await fetch(`${cfg.masterUrl}/api/v1${path}`, { method, headers: { 'content-type': 'application/json', 'x-gateway-secret': cfg.gatewaySecret, 'x-application-id': tenantId }, body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(10000), redirect: 'error' }); }
@@ -92,6 +118,20 @@ export function platformRoutes(app, db, cfg, storage, adapters, management) {
     await db('platform_agents').where({ id: req.params.id, tenant_id: bank.tenant_id }).update(patch); if (patch.password_hash || patch.active === false) await db('platform_sessions').where({ subject_id: req.params.id }).update({ revoked_at: new Date(), refresh_hash: null }); await audit(db, req.dashboard, 'agent.updated', { id: req.params.id }, bank.id); json(res, await db('platform_agents').select('id', 'username', 'name', 'active').where({ id: req.params.id }).first());
   });
   app.delete(`${p}/agents/:id`, async (req, res) => { requireRole(req.dashboard, 'superadmin', 'admin', 'bank'); const { application, bank } = await context(req.query.application_id, req.dashboard); if (!await db('dashboard_application_agents').where({ application_id: application.id, agent_id: req.params.id }).first()) throw fail(404, 'AGENT_NOT_FOUND'); await db('platform_agents').where({ id: req.params.id, tenant_id: bank.tenant_id }).update({ active: false, updated_at: new Date() }); await db('platform_sessions').where({ subject_id: req.params.id }).update({ revoked_at: new Date(), refresh_hash: null }); await audit(db, req.dashboard, 'agent.deactivated', { id: req.params.id }, bank.id); json(res, { active: false }); });
+  app.get(`${p}/customers/report`, async (req, res) => {
+    requireRole(req.dashboard, 'superadmin', 'admin', 'bank');
+    const { application, bank } = await context(req.query.application_id, req.dashboard);
+    const q = reportQuery({ ...req.query, status: undefined });
+    if (req.query.status && !['waiting', 'verified', 'not_verified', 'rejected'].includes(req.query.status)) throw fail(422, 'INVALID_CUSTOMER_STATUS');
+    const query = db('platform_customers as c').join('dashboard_customer_applications as m', 'c.id', 'm.customer_id').where({ 'm.application_id': application.id, 'c.tenant_id': bank.tenant_id }).whereNull('c.deleted_at');
+    if (q.from) query.where('c.created_at', '>=', q.from);
+    if (q.until) query.where('c.created_at', '<', q.until);
+    if (req.query.status) query.where('c.verification_status', req.query.status);
+    if (q.search) query.whereRaw('c.id::text ILIKE ?', [`%${q.search}%`]);
+    const [count, statuses, ids] = await Promise.all([query.clone().count('* as total').first(), query.clone().select('c.verification_status').count('* as count').groupBy('c.verification_status'), query.clone().select('c.id').orderBy('c.created_at', q.direction).orderBy('c.id').limit(q.size).offset(q.offset)]);
+    const rows = await Promise.all(ids.map(row => master(bank.tenant_id, `/users/${row.id}`)));
+    json(res, { rows, total: Number(count.total), page: q.page, page_size: q.size, count_by_status: statuses.map(row => ({ status: row.verification_status, count: Number(row.count) })) });
+  });
   app.get(`${p}/customers`, async (req, res) => {
     requireRole(req.dashboard, 'superadmin', 'admin', 'bank'); const { application, bank } = await context(req.query.application_id, req.dashboard);
     const ids = await db('dashboard_customer_applications').where({ application_id: application.id }).select('customer_id').limit(limit(req)).offset(offset(req));
@@ -99,6 +139,12 @@ export function platformRoutes(app, db, cfg, storage, adapters, management) {
     json(res, data);
   });
   app.get(`${p}/customers/:id`, async (req, res) => { requireRole(req.dashboard, 'superadmin', 'admin', 'bank'); const { application, bank } = await context(req.query.application_id, req.dashboard); if (!await db('dashboard_customer_applications').where({ application_id: application.id, customer_id: req.params.id }).first()) throw fail(404, 'CUSTOMER_NOT_FOUND'); json(res, await master(bank.tenant_id, `/users/${encodeURIComponent(req.params.id)}`)); });
+  app.get(`${p}/customers/:id/activity`, async (req, res) => {
+    requireRole(req.dashboard, 'superadmin', 'admin', 'bank'); const { application, bank } = await context(req.query.application_id, req.dashboard);
+    if (!await db('dashboard_customer_applications').where({ application_id: application.id, customer_id: req.params.id }).first()) throw fail(404, 'CUSTOMER_NOT_FOUND');
+    const [calls, events] = await Promise.all([db('platform_calls').where({ tenant_id: bank.tenant_id, user_id: req.params.id }).select('id', 'state', 'outcome', 'reason', 'created_at', 'started_at', 'ended_at').orderBy('created_at', 'desc').limit(100), db('platform_audit').where({ tenant_id: bank.tenant_id, subject_id: req.params.id }).select('id', 'action', 'created_at').orderBy('created_at', 'desc').limit(100)]);
+    json(res, { calls, events });
+  });
   app.delete(`${p}/customers/:id`, async (req, res) => { requireRole(req.dashboard, 'superadmin', 'admin', 'bank'); const { application, bank } = await context(req.query.application_id, req.dashboard); if (!await db('dashboard_customer_applications').where({ application_id: application.id, customer_id: req.params.id }).first()) throw fail(404, 'CUSTOMER_NOT_FOUND'); await master(bank.tenant_id, `/users/softdelete/${encodeURIComponent(req.params.id)}`, { method: 'POST' }); await audit(db, req.dashboard, 'customer.soft_deleted', { id: req.params.id }, bank.id); json(res, { deleted: true }); });
   app.get(`${p}/calls`, async (req, res) => {
     requireRole(req.dashboard, 'superadmin', 'admin', 'bank'); const { application, bank } = await context(req.query.application_id, req.dashboard);
@@ -109,6 +155,18 @@ export function platformRoutes(app, db, cfg, storage, adapters, management) {
     const call = await db('platform_calls as c').join('dashboard_customer_applications as x', 'c.user_id', 'x.customer_id').where({ 'c.id': req.params.id, 'c.tenant_id': bank.tenant_id, 'x.application_id': application.id }).select('c.*').first(); if (!call) throw fail(404, 'CALL_NOT_FOUND');
     const recording = await db('platform_recordings').where({ call_id: call.id }).select('id', 'state', 'sha256', 'bytes', 'created_at').first(); json(res, { ...call, notification: undefined, registration_key: undefined, recording });
   });
+  app.get(`${p}/calls/:id/recording`, async (req, res) => {
+    requireRole(req.dashboard, 'superadmin', 'bank');
+    const { application, bank } = await context(req.query.application_id, req.dashboard);
+    const call = await db('platform_calls as c').join('dashboard_customer_applications as m', 'c.user_id', 'm.customer_id').where({ 'c.id': req.params.id, 'c.tenant_id': bank.tenant_id, 'm.application_id': application.id }).select('c.id').first();
+    if (!call) throw fail(404, 'CALL_NOT_FOUND');
+    const recording = await db('platform_recordings').where({ call_id: call.id, tenant_id: bank.tenant_id, state: 'stored' }).first();
+    if (!recording?.object_key) throw fail(409, 'RECORDING_NOT_STORED');
+    const object = await storage.get(recording.bucket || cfg.recordingBucket || 'ekyc-recordings', recording.object_key);
+    await audit(db, req.dashboard, 'recording.downloaded', { call_id: call.id }, bank.id);
+    res.type('video/mp4').set({ 'cache-control': 'private, no-store', 'content-disposition': `attachment; filename="recording-${call.id}.mp4"` });
+    await pipeline(object.Body, res);
+  });
   app.get(`${p}/customers/:id/documents`, async (req, res) => { requireRole(req.dashboard, 'superadmin', 'admin', 'bank'); const { application, bank } = await context(req.query.application_id, req.dashboard); if (!await db('dashboard_customer_applications').where({ application_id: application.id, customer_id: req.params.id }).first()) throw fail(404, 'CUSTOMER_NOT_FOUND'); json(res, await master(bank.tenant_id, `/document/${encodeURIComponent(req.params.id)}`)); });
   app.get(`${p}/documents/:id/download`, async (req, res) => {
     requireRole(req.dashboard, 'superadmin', 'admin', 'bank'); const { application, bank } = await context(req.query.application_id, req.dashboard);
@@ -116,7 +174,29 @@ export function platformRoutes(app, db, cfg, storage, adapters, management) {
     const object = await storage.get(doc.bucket, doc.object_key); res.type(doc.mimetype).set({ 'cache-control': 'private, no-store', 'content-disposition': `attachment; filename="${doc.id}"` }); await pipeline(object.Body, res);
   });
   app.get(`${p}/quota`, async (req, res) => { const q = db('platform_quotas as q').join('dashboard_banks as b', 'q.tenant_id', 'b.tenant_id').select('q.service', 'q.remaining', 'b.id as bank_id', 'b.name as bank_name').orderBy('b.name'); if (req.dashboard.role === 'bank' || req.dashboard.role === 'officer') q.where('b.id', req.dashboard.bank_id); else if (req.query.bank_id) q.where('b.id', req.query.bank_id); json(res, await q); });
-  app.get(`${p}/usage`, async (req, res) => { const { application } = await context(req.query.application_id, req.dashboard); if (!/\d{4}-\d{2}-\d{2}/.test(req.query.from || '') || !/\d{4}-\d{2}-\d{2}/.test(req.query.to || '')) throw fail(422, 'DATE_RANGE_REQUIRED'); json(res, await adapters.usage.forApplication(application, req.query.from, req.query.to)); });
-  app.get(`${p}/storage`, async (req, res) => { const bankId = ['bank', 'officer'].includes(req.dashboard.role) ? req.dashboard.bank_id : req.query.bank_id; if (!bankId) throw fail(422, 'BANK_ID_REQUIRED'); const bank = await management.bank(bankId); if (['bank', 'officer'].includes(req.dashboard.role) && bank.id !== req.dashboard.bank_id) throw fail(403, 'CROSS_BANK_ACCESS'); const docs = await db('platform_documents').where({ tenant_id: bank.tenant_id }).count('* as count').first(); const recordings = await db('platform_recordings').where({ tenant_id: bank.tenant_id, state: 'stored' }).count('* as count').first(); json(res, { provider: 'seaweedfs', documents: Number(docs.count), recordings: Number(recordings.count), tenant_id: bank.tenant_id }); });
-  for (const feature of ['ocr', 'liveness']) app.get(`${p}/${feature}`, async (req, _res) => { await context(req.query.application_id, req.dashboard); throw fail(503, `${feature.toUpperCase()}_HISTORY_NOT_MIGRATED`); });
+  const usage = async req => {
+    requireRole(req.dashboard, 'superadmin', 'bank');
+    const { application } = await context(req.query.application_id, req.dashboard);
+    const q = reportQuery(req.query);
+    if (!q.from || !q.until) throw fail(422, 'DATE_RANGE_REQUIRED');
+    return adapters.usage.forApplication(application, req.query.from, req.query.to);
+  };
+  app.get(`${p}/usage`, async (req, res) => json(res, await usage(req)));
+  app.get(`${p}/usage/export`, async (req, res) => {
+    const result = await usage(req);
+    const rows = (result.totals || []).map(row => [row.key, row.doc_count]);
+    res.type('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet').set({ 'cache-control': 'private, no-store', 'content-disposition': 'attachment; filename="api-usage.xlsx"' }).send(makeXlsx([['usage', ['Service', 'Requests'], rows]]));
+  });
+  app.get(`${p}/storage`, async (req, res) => {
+    const bankId = ['bank', 'officer'].includes(req.dashboard.role) ? req.dashboard.bank_id : req.query.bank_id;
+    if (!bankId) throw fail(422, 'BANK_ID_REQUIRED');
+    const bank = await management.bank(bankId);
+    if (['bank', 'officer'].includes(req.dashboard.role) && bank.id !== req.dashboard.bank_id) throw fail(403, 'CROSS_BANK_ACCESS');
+    const docs = await db('platform_documents').where({ tenant_id: bank.tenant_id }).count('* as count').first();
+    const recordings = await db('platform_recordings').where({ tenant_id: bank.tenant_id, state: 'stored' }).count('* as count').first();
+    const provision = await db('platform_tenant_storage').where({ tenant_id: bank.tenant_id }).first();
+    json(res, { provider: 'seaweedfs', documents: Number(docs.count), recordings: Number(recordings.count), tenant_id: bank.tenant_id,
+      recording_bucket: provision?.recording_bucket, provisioning_state: provision?.state || 'not_configured',
+      provisioning_error: provision?.last_error_code || null, console_url: `${cfg.storageConsoleOrigin || 'http://127.0.0.1:58082'}/bank/login`, storage_permissions: ['recordings:list', 'recordings:download'] });
+  });
 }

@@ -1,7 +1,10 @@
-import { randomUUID } from 'node:crypto';
+import { randomUUID, randomBytes, createHash } from 'node:crypto';
 import bcrypt from 'bcryptjs';
 import { fail, requireRole, bankScope, audit } from './auth.js';
 import { planPolicy } from './integrations.js';
+import { Encryption } from '@ekyc/shared/encryption';
+import { required } from '@ekyc/shared/config';
+import { queueBankStorage } from '@ekyc/shared/bank-storage';
 
 const text = (value, max = 150) => typeof value === 'string' ? value.trim().slice(0, max) : '';
 const email = value => { const result = text(value, 254); if (result && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(result)) throw fail(422, 'INVALID_EMAIL'); return result || null; };
@@ -12,7 +15,7 @@ const bankMember = actor => requireRole(actor, 'superadmin', 'admin', 'bank', 'o
 const page = req => ({ limit: Math.min(100, Math.max(1, Number(req.query.limit) || 25)), offset: Math.max(0, Number(req.query.page) || 0) * Math.min(100, Math.max(1, Number(req.query.limit) || 25)) });
 const safeAccount = row => { const { password_hash: _password, reset_hash: _reset, reset_expires_at: _expiry, ...safe } = row; return safe; };
 
-export function managementRoutes(app, db, adapters) {
+export function managementRoutes(app, db, adapters, cfg = {}) {
   const p = '/dashboard/api/v1';
   const bank = async id => { const row = await db('dashboard_banks').where({ id }).first(); if (!row) throw fail(404, 'BANK_NOT_FOUND'); return row; };
   const appRow = async (id, actor) => { const row = await db('dashboard_applications').where({ id }).first(); if (!row) throw fail(404, 'APPLICATION_NOT_FOUND'); bankScope(actor, row.bank_id); return row; };
@@ -22,25 +25,49 @@ export function managementRoutes(app, db, adapters) {
     const applications = await db('dashboard_applications').modify(q => { if (bankId) q.where({ bank_id: bankId }); }).count('* as count').first();
     const agents = await db('platform_agents').modify(q => { if (bankId) q.where({ tenant_id: db('dashboard_banks').select('tenant_id').where({ id: bankId }) }); }).count('* as count').first();
     const customers = await db('platform_customers').whereNull('deleted_at').modify(q => { if (bankId) q.where({ tenant_id: db('dashboard_banks').select('tenant_id').where({ id: bankId }) }); }).count('* as count').first();
-    json(res, { banks: Number(banks.count), applications: Number(applications.count), agents: Number(agents.count), customers: Number(customers.count) });
+    const plans = ['admin', 'superadmin'].includes(actor.role) ? await db('dashboard_plans').count('* as count').first() : null;
+    json(res, { banks: Number(banks.count), plans: plans ? Number(plans.count) : null, applications: Number(applications.count), agents: Number(agents.count), customers: Number(customers.count) });
   });
   app.get(`${p}/banks`, async (req, res) => { const q = db('dashboard_banks').orderBy('name'); if (['bank', 'officer'].includes(req.dashboard.role)) q.where({ id: req.dashboard.bank_id }); json(res, await q); });
   app.get(`${p}/banks/:id`, async (req, res) => { bankScope(req.dashboard, req.params.id); json(res, await bank(req.params.id)); });
   app.post(`${p}/banks`, async (req, res) => {
     admin(req.dashboard); const username = text(req.body?.username, 80).toLowerCase(); const name = text(req.body?.name);
-    if (!/^[a-z0-9][a-z0-9_-]{2,79}$/.test(username) || !name) throw fail(422, 'INVALID_BANK');
+    if (!/^[a-z0-9][a-z0-9_.@!-]{2,79}$/.test(username) || !name) throw fail(422, 'INVALID_BANK');
     const id = randomUUID(); const tenantId = randomUUID();
+    let encryption = {};
+    if (!cfg.encryptionMock) {
+      // Preserve BankController's external encryption payload and ciphertext.
+      encryption = await new Encryption(cfg).request('encrypt', { key: required('MASTER_ENCRYPTION_KEY'), IV: required('MASTER_ENCRYPTION_IV'), data: { encryption_key: randomBytes(32).toString('base64'), iv: randomBytes(16).toString('base64') } });
+      if (!encryption || typeof encryption.encryption_key !== 'string' || typeof encryption.iv !== 'string') throw fail(502, 'INVALID_TENANT_ENCRYPTION_RESPONSE');
+    }
+    const adminUsername = text(req.body.admin_username, 100).toLowerCase();
+    const adminEmail = email(req.body.admin_email);
+    if ((adminUsername || adminEmail) && (!adminUsername || !adminEmail)) throw fail(422, 'BANK_ADMIN_USERNAME_AND_EMAIL_REQUIRED');
+    const reset = adminUsername ? randomBytes(32).toString('base64url') : null;
     const row = await db.transaction(async trx => {
-      await trx('platform_tenants').insert({ id: tenantId, name });
+      await trx('platform_tenants').insert({ id: tenantId, name, encryption });
       const [created] = await trx('dashboard_banks').insert({ id, tenant_id: tenantId, username, name, email: email(req.body.email) }).returning('*');
+      if (adminUsername) {
+        const accountId = randomUUID();
+        await trx('dashboard_accounts').insert({ id: accountId, bank_id: id, username: adminUsername, email: adminEmail, role: 'bank', password_hash: await bcrypt.hash(randomBytes(48).toString('base64url'), 12), reset_hash: createHash('sha256').update(reset).digest('hex'), reset_expires_at: new Date(Date.now() + 3600000) });
+        await audit(trx, req.dashboard, 'bank.admin_invited', { account_id: accountId }, id);
+      }
+      await queueBankStorage(trx, created);
       await audit(trx, req.dashboard, 'bank.created', { id }, id); return created;
-    }); json(res, row);
+    });
+    let delivery;
+    if (reset) {
+      try { const result = await adapters.email.sendReset({ to: adminEmail, url: `${cfg.origin}/reset-password?token=${reset}&email=${encodeURIComponent(adminEmail)}` }); delivery = result?.mode === 'synthetic' || cfg.mockExternal ? 'mock' : 'email'; }
+      catch { delivery = 'failed'; await audit(db, req.dashboard, 'bank.invitation_delivery_failed', { bank_id: id }, id); }
+    }
+    json(res, { ...row, ...(delivery ? { invitation_delivery: delivery } : {}) });
   });
   app.patch(`${p}/banks/:id`, async (req, res) => { admin(req.dashboard); const row = await bank(req.params.id); const patch = { updated_at: new Date() }; if (req.body.name !== undefined) { patch.name = text(req.body.name); if (!patch.name) throw fail(422, 'INVALID_BANK'); } if (req.body.email !== undefined) patch.email = email(req.body.email); if (req.body.active !== undefined) patch.active = Boolean(req.body.active); await db.transaction(async trx => { await trx('dashboard_banks').where({ id: row.id }).update(patch); if (patch.active !== undefined) await trx('platform_tenants').where({ id: row.tenant_id }).update({ active: patch.active }); await audit(trx, req.dashboard, 'bank.updated', { id: row.id }, row.id); }); json(res, await bank(row.id)); });
   app.delete(`${p}/banks/:id`, async (req, res) => { admin(req.dashboard); const row = await bank(req.params.id); if (await db('dashboard_applications').where({ bank_id: row.id, status: 'confirmed' }).first()) throw fail(409, 'BANK_HAS_ACTIVE_APPLICATIONS'); await db.transaction(async trx => { await trx('dashboard_banks').where({ id: row.id }).update({ active: false }); await trx('platform_tenants').where({ id: row.tenant_id }).update({ active: false }); await audit(trx, req.dashboard, 'bank.deactivated', { id: row.id }, row.id); }); json(res, { active: false }); });
 
-  app.get(`${p}/plans`, async (_req, res) => json(res, await db('dashboard_plans').orderBy('name')));
-  app.post(`${p}/plans`, async (req, res) => { admin(req.dashboard); const name = text(req.body?.name), shortname = text(req.body?.shortname, 60).toLowerCase(); if (!name || !/^[a-z0-9_-]{2,60}$/.test(shortname)) throw fail(422, 'INVALID_PLAN'); const features = req.body.features; if (!Array.isArray(features) || !features.every(x => typeof x === 'string' && x.length < 60)) throw fail(422, 'INVALID_PLAN_FEATURES'); const limits = req.body.limits && typeof req.body.limits === 'object' ? req.body.limits : {}; planPolicy({ shortname, limits }); const [row] = await db('dashboard_plans').insert({ id: randomUUID(), name, shortname, description: text(req.body.description, 1000), features: JSON.stringify(features), limits: JSON.stringify(limits) }).returning('*'); await audit(db, req.dashboard, 'plan.created', { id: row.id }); json(res, row); });
+  app.get(`${p}/plans`, async (req, res) => { const plans = await db('dashboard_plans').orderBy('name'); if (['admin', 'superadmin'].includes(req.dashboard.role)) { const counts = await db('dashboard_applications').select('plan_id').count('* as count').groupBy('plan_id'); for (const plan of plans) plan.subscribed_applications = Number(counts.find(row => row.plan_id === plan.id)?.count || 0); } json(res, plans); });
+  app.get(`${p}/plan-routes`, async (req, res) => { admin(req.dashboard); if (cfg.kongMock ?? cfg.mockExternal) return json(res, { source: 'synthetic', rows: [{ id: 'synthetic-video-route', name: 'Video call API (simulation)' }] }); const result = await adapters.kong.request('/routes?size=1000'); json(res, { source: 'kong', rows: (result.data || []).filter(row => !row.tags?.includes('public')).map(row => ({ id: row.id, name: row.name || row.id, methods: row.methods || [], paths: row.paths || [] })) }); });
+  app.post(`${p}/plans`, async (req, res) => { admin(req.dashboard); const name = text(req.body?.name), shortname = text(req.body?.shortname, 60).toLowerCase() || `${name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 45) || 'plan'}-${randomBytes(4).toString('hex')}`; if (!name || !/^[a-z0-9_-]{2,60}$/.test(shortname)) throw fail(422, 'INVALID_PLAN'); const features = req.body.features; if (!Array.isArray(features) || !features.every(x => typeof x === 'string' && x.length < 60)) throw fail(422, 'INVALID_PLAN_FEATURES'); const limits = req.body.limits && typeof req.body.limits === 'object' ? req.body.limits : {}; planPolicy({ shortname, limits }); const [row] = await db('dashboard_plans').insert({ id: randomUUID(), name, shortname, description: text(req.body.description, 1000), features: JSON.stringify(features), limits: JSON.stringify(limits) }).returning('*'); await audit(db, req.dashboard, 'plan.created', { id: row.id }); json(res, row); });
   app.patch(`${p}/plans/:id`, async (req, res) => { admin(req.dashboard); const current = await db('dashboard_plans').where({ id: req.params.id }).first(); if (!current) throw fail(404, 'PLAN_NOT_FOUND'); const patch = { updated_at: new Date() }; if (req.body.name !== undefined) patch.name = text(req.body.name); if (req.body.description !== undefined) patch.description = text(req.body.description, 1000); if (req.body.features !== undefined) { if (!Array.isArray(req.body.features)) throw fail(422, 'INVALID_PLAN_FEATURES'); patch.features = JSON.stringify(req.body.features); } if (req.body.limits !== undefined) { if (await db('dashboard_applications').where({ plan_id: current.id, status: 'confirmed' }).first()) throw fail(409, 'PLAN_IN_USE_ASSIGN_NEW_PLAN'); planPolicy({ ...current, limits: req.body.limits }); patch.limits = JSON.stringify(req.body.limits); } await db('dashboard_plans').where({ id: current.id }).update(patch); await audit(db, req.dashboard, 'plan.updated', { id: current.id }); json(res, await db('dashboard_plans').where({ id: current.id }).first()); });
   app.delete(`${p}/plans/:id`, async (req, res) => { admin(req.dashboard); if (await db('dashboard_applications').where({ plan_id: req.params.id }).first()) throw fail(409, 'PLAN_IN_USE'); await db('dashboard_plans').where({ id: req.params.id }).del(); await audit(db, req.dashboard, 'plan.deleted', { id: req.params.id }); json(res, { deleted: true }); });
 
@@ -64,7 +91,7 @@ export function managementRoutes(app, db, adapters) {
       await audit(trx, req.dashboard, 'application.approved', { id: row.id, mode: consumer.mode || 'kong', rate_limit_per_minute: consumer.rate_limit_per_minute }, row.bank_id);
       return { row: { ...row, status: 'confirmed', kong_consumer_id: consumer.id, activated_at: new Date() }, consumer };
     });
-    json(res, { ...approved.row, ...(approved.consumer?.api_key ? { api_key: approved.consumer.api_key, api_key_delivery: 'one_time' } : {}), ...(approved.consumer?.rate_limit_per_minute ? { rate_limit_per_minute: approved.consumer.rate_limit_per_minute, acl_group: approved.consumer.acl_group } : {}) });
+    json(res, { ...approved.row, ...(approved.consumer?.api_key ? { api_key: approved.consumer.api_key, api_key_delivery: 'one_time' } : {}), ...(approved.consumer?.rate_limit_policy ? { rate_limit_policy: approved.consumer.rate_limit_policy, acl_group: approved.consumer.acl_group } : {}), ...(approved.consumer?.rate_limit_per_minute ? { rate_limit_per_minute: approved.consumer.rate_limit_per_minute, acl_group: approved.consumer.acl_group } : {}) });
   });
   app.post(`${p}/applications/:id/plan`, async (req, res) => {
     admin(req.dashboard);
@@ -120,16 +147,48 @@ export function managementRoutes(app, db, adapters) {
       if (consumer.mode !== 'kong') throw fail(503, 'KONG_NOT_CONNECTED');
       await trx('dashboard_applications').where({ id: row.id }).update({ kong_consumer_id: consumer.id, updated_at: new Date() });
       await audit(trx, req.dashboard, 'application.kong_connected', { id: row.id, consumer_id: consumer.id, rate_limit_per_minute: consumer.rate_limit_per_minute, acl_group: consumer.acl_group }, row.bank_id);
-      return { ...row, kong_consumer_id: consumer.id, api_key: consumer.api_key, api_key_delivery: 'one_time', rate_limit_per_minute: consumer.rate_limit_per_minute, acl_group: consumer.acl_group };
+      return { ...row, kong_consumer_id: consumer.id, api_key: consumer.api_key, api_key_delivery: 'one_time', rate_limit_per_minute: consumer.rate_limit_per_minute, rate_limit_policy: consumer.rate_limit_policy, acl_group: consumer.acl_group };
     });
     json(res, result);
   });
   app.post(`${p}/applications/:id/reject`, async (req, res) => { admin(req.dashboard); const row = await appRow(req.params.id, req.dashboard); if (row.status !== 'waiting') throw fail(409, 'APPLICATION_NOT_WAITING'); await db('dashboard_applications').where({ id: row.id }).update({ status: 'rejected', updated_at: new Date() }); await audit(db, req.dashboard, 'application.rejected', { id: row.id, reason: text(req.body?.reason, 500) }, row.bank_id); json(res, await appRow(row.id, req.dashboard)); });
 
-  app.get(`${p}/accounts`, async (req, res) => { requireRole(req.dashboard, 'superadmin', 'admin', 'bank'); const q = db('dashboard_accounts').orderBy('username'); if (req.dashboard.role === 'bank') q.where({ bank_id: req.dashboard.bank_id }); else if (req.query.bank_id) q.where({ bank_id: req.query.bank_id }); json(res, (await q).map(safeAccount)); });
-  app.post(`${p}/accounts`, async (req, res) => { admin(req.dashboard); const role = req.body?.role; if (!['superadmin', 'admin', 'bank'].includes(role)) throw fail(422, 'INVALID_ROLE'); if (role === 'superadmin') requireRole(req.dashboard, 'superadmin'); const bankId = role === 'bank' ? req.body.bank_id : null; if (role === 'bank') await bank(bankId); const username = text(req.body.username, 100); if (!username) throw fail(422, 'USERNAME_REQUIRED'); const [row] = await db('dashboard_accounts').insert({ id: randomUUID(), username, email: email(req.body.email), role, bank_id: bankId, password_hash: await password(req.body.password) }).returning('*'); await audit(db, req.dashboard, 'account.created', { id: row.id }, bankId); json(res, safeAccount(row)); });
-  app.patch(`${p}/accounts/:id`, async (req, res) => { admin(req.dashboard); const current = await db('dashboard_accounts').where({ id: req.params.id }).first(); if (!current) throw fail(404, 'ACCOUNT_NOT_FOUND'); if (current.role === 'superadmin') requireRole(req.dashboard, 'superadmin'); const patch = { updated_at: new Date() }; if (req.body.email !== undefined) patch.email = email(req.body.email); if (req.body.active !== undefined) patch.active = Boolean(req.body.active); if (req.body.password !== undefined) patch.password_hash = await password(req.body.password); await db('dashboard_accounts').where({ id: current.id }).update(patch); await audit(db, req.dashboard, 'account.updated', { id: current.id }, current.bank_id); json(res, safeAccount(await db('dashboard_accounts').where({ id: current.id }).first())); });
-  app.delete(`${p}/accounts/:id`, async (req, res) => { admin(req.dashboard); if (req.params.id === req.dashboard.id) throw fail(409, 'CANNOT_DISABLE_SELF'); const row = await db('dashboard_accounts').where({ id: req.params.id }).first(); if (!row) throw fail(404, 'ACCOUNT_NOT_FOUND'); if (row.role === 'superadmin') requireRole(req.dashboard, 'superadmin'); await db('dashboard_accounts').where({ id: row.id }).update({ active: false }); await audit(db, req.dashboard, 'account.deactivated', { id: row.id }, row.bank_id); json(res, { active: false }); });
+  app.get(`${p}/accounts`, async (req, res) => {
+    requireRole(req.dashboard, 'superadmin', 'admin', 'bank');
+    if (req.dashboard.role === 'bank' && req.query.bank_id) bankScope(req.dashboard, req.query.bank_id);
+    const bankId = req.dashboard.role === 'bank' ? req.dashboard.bank_id : req.query.bank_id;
+    const q = db('dashboard_accounts').orderBy('username');
+    if (bankId) { bankScope(req.dashboard, bankId); q.where({ bank_id: bankId, role: 'bank' }); }
+    else { requireRole(req.dashboard, 'superadmin'); q.whereIn('role', ['admin', 'superadmin']); }
+    json(res, (await q).map(safeAccount));
+  });
+  app.post(`${p}/accounts`, async (req, res) => {
+    admin(req.dashboard); const role = req.body?.role;
+    if (!['superadmin', 'admin', 'bank'].includes(role)) throw fail(422, 'INVALID_ROLE');
+    if (role !== 'bank') requireRole(req.dashboard, 'superadmin');
+    const bankId = role === 'bank' ? req.body.bank_id : null;
+    if (role === 'bank') await bank(bankId);
+    const username = text(req.body.username, 100), accountEmail = email(req.body.email);
+    if (!username) throw fail(422, 'USERNAME_REQUIRED');
+    const invited = req.body.password === undefined || req.body.password === '';
+    if (invited && !accountEmail) throw fail(422, 'INVITATION_EMAIL_REQUIRED');
+    const reset = invited ? randomBytes(32).toString('base64url') : null;
+    const passwordHash = invited ? await bcrypt.hash(randomBytes(48).toString('base64url'), 12) : await password(req.body.password);
+    const row = await db.transaction(async trx => {
+      const [created] = await trx('dashboard_accounts').insert({ id: randomUUID(), username, email: accountEmail, role, bank_id: bankId, password_hash: passwordHash, ...(invited ? { reset_hash: createHash('sha256').update(reset).digest('hex'), reset_expires_at: new Date(Date.now() + 3600000) } : {}) }).returning('*');
+        if (role === 'bank') await queueBankStorage(trx, await bank(bankId));
+        await audit(trx, req.dashboard, invited ? 'account.invited' : 'account.created', { id: created.id }, bankId);
+      return created;
+    });
+    let delivery;
+    if (invited) {
+      try { const result = await adapters.email.sendReset({ to: accountEmail, url: cfg.origin + '/reset-password?token=' + reset + '&email=' + encodeURIComponent(accountEmail) }); delivery = result?.mode === 'synthetic' || cfg.mockExternal ? 'mock' : 'email'; }
+      catch { delivery = 'failed'; await audit(db, req.dashboard, 'account.invitation_delivery_failed', { account_id: row.id }, bankId); }
+    }
+    json(res, { ...safeAccount(row), ...(delivery ? { invitation_delivery: delivery } : {}) });
+  });
+  app.patch(`${p}/accounts/:id`, async (req, res) => { admin(req.dashboard); const current = await db('dashboard_accounts').where({ id: req.params.id }).first(); if (!current) throw fail(404, 'ACCOUNT_NOT_FOUND'); if (current.role !== 'bank') requireRole(req.dashboard, 'superadmin'); if (current.id === req.dashboard.id && req.body.active === false) throw fail(409, 'CANNOT_DISABLE_SELF'); if (req.body.role !== undefined && req.body.role !== current.role) throw fail(422, 'ACCOUNT_ROLE_IMMUTABLE'); if (req.body.bank_id !== undefined && req.body.bank_id !== current.bank_id) throw fail(422, 'ACCOUNT_BANK_IMMUTABLE'); const patch = { updated_at: new Date() }; if (req.body.username !== undefined) { patch.username = text(req.body.username, 100); if (!patch.username) throw fail(422, 'USERNAME_REQUIRED'); } if (req.body.email !== undefined) patch.email = email(req.body.email); if (req.body.active !== undefined) patch.active = Boolean(req.body.active); if (req.body.password !== undefined) patch.password_hash = await password(req.body.password); await db('dashboard_accounts').where({ id: current.id }).update(patch); await audit(db, req.dashboard, 'account.updated', { id: current.id }, current.bank_id); json(res, safeAccount(await db('dashboard_accounts').where({ id: current.id }).first())); });
+  app.delete(`${p}/accounts/:id`, async (req, res) => { admin(req.dashboard); if (req.params.id === req.dashboard.id) throw fail(409, 'CANNOT_DISABLE_SELF'); const row = await db('dashboard_accounts').where({ id: req.params.id }).first(); if (!row) throw fail(404, 'ACCOUNT_NOT_FOUND'); if (row.role !== 'bank') requireRole(req.dashboard, 'superadmin'); await db('dashboard_accounts').where({ id: row.id }).update({ active: false }); await audit(db, req.dashboard, 'account.deactivated', { id: row.id }, row.bank_id); json(res, { active: false }); });
 
   app.get(`${p}/officers`, async (req, res) => { bankMember(req.dashboard); const q = db('dashboard_officers').orderBy('name'); if (['bank', 'officer'].includes(req.dashboard.role)) q.where({ bank_id: req.dashboard.bank_id }); else if (req.query.bank_id) q.where({ bank_id: req.query.bank_id }); json(res, (await q).map(safeAccount)); });
   app.post(`${p}/officers`, async (req, res) => { requireRole(req.dashboard, 'superadmin', 'admin', 'bank'); const bankId = req.dashboard.role === 'bank' ? req.dashboard.bank_id : req.body.bank_id; bankScope(req.dashboard, bankId); await bank(bankId); const username = text(req.body.username, 100), name = text(req.body.name); if (!username || !name) throw fail(422, 'INVALID_OFFICER'); const [row] = await db('dashboard_officers').insert({ id: randomUUID(), bank_id: bankId, username, name, email: email(req.body.email), password_hash: await password(req.body.password) }).returning('*'); await audit(db, req.dashboard, 'officer.created', { id: row.id }, bankId); json(res, safeAccount(row)); });

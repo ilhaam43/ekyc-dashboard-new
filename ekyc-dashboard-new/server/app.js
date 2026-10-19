@@ -6,6 +6,8 @@ import { authRoutes, fail } from './auth.js';
 import { managementRoutes } from './management.js';
 import { platformRoutes } from './platform.js';
 import { exportRoutes } from './exports.js';
+import { callbackAdapter } from './callbacks.js';
+import { reportRoutes } from './reports.js';
 
 const root = path.dirname(fileURLToPath(new URL('../package.json', import.meta.url)));
 export function createDashboardApp(db, redis, cfg, storage, adapters) {
@@ -15,7 +17,8 @@ export function createDashboardApp(db, redis, cfg, storage, adapters) {
   app.get('/health/live', (_req, res) => res.json({ status: 'ok' }));
   app.get('/health/ready', async (_req, res) => { await Promise.all([db.raw('select 1'), redis.ping()]); res.json({ status: 'ready' }); });
   authRoutes(app, db, redis, cfg, adapters);
-  const management = managementRoutes(app, db, adapters);
+  const management = managementRoutes(app, db, adapters, cfg);
+  reportRoutes(app, db, { ...adapters, callbacks: adapters.callbacks || callbackAdapter(cfg, adapters.kong) }, management);
   platformRoutes(app, db, cfg, storage, adapters, management);
   exportRoutes(app, db, storage, cfg);
   app.use('/dashboard/api', (_req, _res, next) => next(fail(404, 'NOT_FOUND')));

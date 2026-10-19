@@ -42,7 +42,7 @@ export function authRoutes(app, db, redis, cfg, adapters) {
       const table = session.kind === 'officer' ? 'dashboard_officers' : 'dashboard_accounts';
       const actor = await db(table).where({ id: session.id, active: true }).first();
       if (!actor || session.credential !== digest(actor.password_hash)) { await redis.del(key); throw fail(401, 'SESSION_EXPIRED'); }
-      req.dashboard = { id: actor.id, role: session.kind === 'officer' ? 'officer' : actor.role, bank_id: actor.bank_id || null, csrf: session.csrf, key };
+      req.dashboard = { id: actor.id, username: actor.username, email: actor.email, role: session.kind === 'officer' ? 'officer' : actor.role, bank_id: actor.bank_id || null, csrf: session.csrf, key };
       if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
         if (!secureEqual(req.headers['x-csrf-token'], session.csrf)) throw fail(403, 'CSRF_INVALID');
         const origin = req.headers.origin;
@@ -51,7 +51,7 @@ export function authRoutes(app, db, redis, cfg, adapters) {
       await redis.expire(key, SESSION_SECONDS); next();
     } catch (error) { next(error); }
   });
-  app.get(`${prefix}/session`, (req, res) => res.set('cache-control', 'no-store').json({ success: true, data: { id: req.dashboard.id, role: req.dashboard.role, bank_id: req.dashboard.bank_id, csrf: req.dashboard.csrf } }));
+  app.get(`${prefix}/session`, (req, res) => res.set('cache-control', 'no-store').json({ success: true, data: { id: req.dashboard.id, username: req.dashboard.username, email: req.dashboard.email, role: req.dashboard.role, bank_id: req.dashboard.bank_id, csrf: req.dashboard.csrf } }));
   app.post(`${prefix}/logout`, async (req, res) => { await redis.del(req.dashboard.key); res.clearCookie('dashboard_sid', { path: '/' }).json({ success: true }); });
   app.post(`${prefix}/profile/password`, async (req, res) => {
     const { current_password: current, new_password: next } = req.body || {};
