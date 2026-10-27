@@ -13,6 +13,7 @@ export async function authenticate(token, cfg, db) {
   assert((session.call_id || null) === (claims.call_id || null), 401, 'SESSION_EXPIRED');
   assert((session.source || 'basic') === (claims.source || 'basic'), 401, 'SESSION_EXPIRED');
   if (claims.role === 'agent') assert(await db('platform_agents').where({ id: claims.sub, tenant_id: claims.tenant_id, active: true }).first(), 401, 'AGENT_INACTIVE');
+  if (claims.role === 'customer') assert(await db('platform_customers').where({ id: claims.sub, tenant_id: claims.tenant_id }).whereNull('deleted_at').first(), 401, 'CUSTOMER_INACTIVE');
   return claims;
 }
 export const auth = (cfg, db, roles = ['agent', 'customer']) => async (req, _res, next) => {

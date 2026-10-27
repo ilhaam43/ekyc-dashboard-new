@@ -1,6 +1,6 @@
 # ekyc-dashboard-new
 
-Independent source repository exported from [ekyc-vidcall-new](https://github.com/ilhaam43/ekyc-vidcall-new), commit 86e3840. Includes this service and the shared JavaScript package it requires. Source layout is preserved so imports remain compatible.
+Independent source repository exported from [ekyc-vidcall-new](https://github.com/ilhaam43/ekyc-vidcall-new), commit 003350c. Includes this service and the shared JavaScript package it requires. Source layout is preserved so imports remain compatible.
 
 ## Develop
 

@@ -55,12 +55,21 @@ async function applyKongPlan(cfg, consumerId, plan, oldPlan = null) {
   const { group } = planPolicy(plan);
   const configuration = planConfiguration(plan);
   const routeIds = configuration.routes.length ? configuration.routes.map(row => row.id) : [cfg.kongApiRouteId];
+  const expanded = new Map();
+  // Existing plans may still select a prefix route. Its operation routes must
+  // receive the same grants and route-scoped limits after catalog migration.
+  for (const routeId of routeIds) {
+    expanded.set(routeId, routeId);
+    const children = asRows(await kongRequest(cfg, `/routes?size=1000&tags=${encodeURIComponent(`parent-${routeId}`)}`));
+    for (const child of children) if (child.tags?.includes(`parent-${routeId}`)) expanded.set(child.id, routeId);
+  }
+  const effectiveRoutes = [...expanded].map(([id, parent]) => ({ ...(configuration.routes.find(row => row.id === parent) || {}), id }));
   const rateConfig = { second: null, minute: null, hour: null, day: null, month: null, year: null, [configuration.period]: configuration.limit, limit_by: 'consumer', policy: cfg.kongRateLimitPolicy };
   if (cfg.kongRateLimitPolicy === 'redis') {
     if (!cfg.kongRateRedisHost) throw fail(503, 'KONG_RATE_LIMIT_REDIS_NOT_CONFIGURED');
     Object.assign(rateConfig, { redis_host: cfg.kongRateRedisHost, redis_port: cfg.kongRateRedisPort, redis_database: cfg.kongRateRedisDatabase, ...(cfg.kongRateRedisPassword ? { redis_password: cfg.kongRateRedisPassword } : {}), ...(cfg.kongRateRedisUsername ? { redis_username: cfg.kongRateRedisUsername } : {}), redis_ssl: cfg.kongRateRedisSsl });
   }
-  for (const routeId of routeIds) {
+  for (const routeId of expanded.keys()) {
   const route = await kongRequest(cfg, `/routes/${encodeURIComponent(routeId)}`);
   if (route.tags?.includes('public')) throw fail(422, 'PUBLIC_ROUTE_CANNOT_BE_ASSIGNED');
   await ensureRoutePlugin(cfg, routeId, 'key-auth', { key_names: ['apikey'], hide_credentials: true, key_in_header: true, key_in_query: false, key_in_body: false });
@@ -83,13 +92,13 @@ async function applyKongPlan(cfg, consumerId, plan, oldPlan = null) {
     const rate = plugins.find(item => item.name === 'rate-limiting' && !item.route);
     if (rate) await kongRequest(cfg, `/plugins/${encodeURIComponent(rate.id)}`, { method: 'PATCH', body: { config: rateConfig } });
     else await kongRequest(cfg, pluginPath, { method: 'POST', body: { name: 'rate-limiting', config: rateConfig } });
-  } else if (configuration.type === 'routes') for (const selected of configuration.routes) {
+  } else if (configuration.type === 'routes') for (const selected of effectiveRoutes) {
     const config = { ...rateConfig, [configuration.period]: null, [selected.period]: selected.limit };
     const rate = plugins.find(item => item.name === 'rate-limiting' && item.route?.id === selected.id);
     if (rate) await kongRequest(cfg, `/plugins/${encodeURIComponent(rate.id)}`, { method: 'PATCH', body: { config } });
     else await kongRequest(cfg, '/plugins', { method: 'POST', body: { name: 'rate-limiting', consumer: { id: consumerId }, route: { id: selected.id }, config } });
   }
-  for (const plugin of plugins.filter(row => row.name === 'rate-limiting' && (configuration.type === 'none' || (configuration.type === 'global' ? row.route : !configuration.routes.some(route => route.id === row.route?.id))))) await kongRequest(cfg, `/plugins/${encodeURIComponent(plugin.id)}`, { method: 'DELETE' });
+  for (const plugin of plugins.filter(row => row.name === 'rate-limiting' && (configuration.type === 'none' || (configuration.type === 'global' ? row.route : !effectiveRoutes.some(route => route.id === row.route?.id))))) await kongRequest(cfg, `/plugins/${encodeURIComponent(plugin.id)}`, { method: 'DELETE' });
   return { rate_limit_per_minute: configuration.type === 'global' && configuration.period === 'minute' ? configuration.limit : null, rate_limit_policy: configuration, acl_group: group };
 }
 

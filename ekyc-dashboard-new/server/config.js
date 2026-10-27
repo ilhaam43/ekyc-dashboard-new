@@ -23,6 +23,6 @@ export function dashboardConfig() {
     recordingBucket: value('RECORDING_BUCKET', 'ekyc-recordings'),
     storageConsoleOrigin: value('STORAGE_CONSOLE_ORIGIN', 'http://127.0.0.1:58082'),
     objectEndpoint: required('OBJECT_ENDPOINT'), objectAccess: required('OBJECT_ACCESS_KEY'), objectSecret: required('OBJECT_SECRET_KEY'),
-    legacyDatabaseUrl: value('LEGACY_DATABASE_URL'), encryptionUrl: value('ENCRYPTION_URL'),
+    legacyDatabaseUrl: value('LEGACY_DATABASE_URL'), encryptionUrl: value('ENCRYPTION_URL'), platformEncryptionUrl: value('PLATFORM_ENCRYPTION_URL'),
   };
 }

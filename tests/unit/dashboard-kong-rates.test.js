@@ -43,3 +43,19 @@ test('no-limit plans remove consumer rate plugins while retaining authentication
   expect(writes.some(row => row.body?.name === 'key-auth')).toBe(true);
   expect(writes.some(row => row.body?.name === 'acl')).toBe(true);
 });
+
+test('legacy prefix plan grants and per-route limits reach its catalog children', async () => {
+  const writes = [];
+  vi.stubGlobal('fetch', async (url, options) => {
+    const parsed = new URL(url), path = parsed.pathname;
+    if (options.method !== 'GET') writes.push({ path, body: options.body && JSON.parse(options.body) });
+    let data = { data: [] };
+    if (path === '/routes' && parsed.searchParams.get('tags') === 'parent-route-1') data = { data: [{ id: 'operation-1', tags: ['parent-route-1'] }] };
+    if (path.startsWith('/routes/') && !path.endsWith('/plugins')) data = { id: path.split('/')[2], tags: [] };
+    return { ok: true, status: 200, json: async () => data };
+  });
+  await integrations(cfg).kong.applyPlan('consumer-1', { shortname: 'legacy', limits: { type: 'routes', routes: [{ id: 'route-1', limit: 12, period: 'hour' }] } });
+  expect(writes.some(row => row.path === '/routes/operation-1/plugins' && row.body.name === 'key-auth')).toBe(true);
+  expect(writes.some(row => row.path === '/routes/operation-1/plugins' && row.body.name === 'acl' && row.body.config.allow.includes('plan-legacy'))).toBe(true);
+  expect(writes.some(row => row.path === '/plugins' && row.body.route.id === 'operation-1' && row.body.config.hour === 12)).toBe(true);
+});

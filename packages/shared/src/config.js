@@ -22,6 +22,7 @@ export function config() {
     jitsiDomain: value('JITSI_DOMAIN', 'meet.localhost'), jitsiSecret: secret('JITSI_JWT_SECRET'),
     jitsiAppId: value('JITSI_APP_ID', 'ekyc'), production: value('NODE_ENV') === 'production',
     encryptionUrl: value('ENCRYPTION_URL'), encryptionMock: value('ENCRYPTION_MOCK') === 'true',
+    platformEncryptionUrl: value('PLATFORM_ENCRYPTION_URL'),
     objectEndpoint: required('OBJECT_ENDPOINT'), objectAccess: required('OBJECT_ACCESS_KEY'), objectSecret: secret('OBJECT_SECRET_KEY'),
     recordingBucket: value('RECORDING_BUCKET', 'ekyc-recordings'), documentBucket: value('DOCUMENT_BUCKET', 'ekyc-documents'),
     valkeyUrl: value('VALKEY_URL', 'redis://localhost:6379'), recordingSlots: Number(value('RECORDING_SLOTS', '5')),
